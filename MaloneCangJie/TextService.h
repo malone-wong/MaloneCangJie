@@ -86,6 +86,7 @@ private:
 
     CComPtr<ITfThreadMgr> _threadMgr;
     CComPtr<ITfComposition> _composition;
+    CComPtr<ITfRange> _displayRange;
     HWND _candidateWindow;
 
     std::wstring _readingBuffer;

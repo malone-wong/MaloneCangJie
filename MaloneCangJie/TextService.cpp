@@ -66,30 +66,19 @@ namespace
                 return _result;
             }
 
-            CComPtr<ITfInsertAtSelection> insertAtSelection;
-            HRESULT hr = _context->QueryInterface(IID_ITfInsertAtSelection, reinterpret_cast<void**>(&insertAtSelection));
-            if (SUCCEEDED(hr))
-            {
-                CComPtr<ITfRange> insertedRange;
-                _result = insertAtSelection->InsertTextAtSelection(
-                    editCookie,
-                    TF_IAS_NOQUERY,
-                    _text.c_str(),
-                    static_cast<LONG>(_text.size()),
-                    &insertedRange);
-                return _result;
-            }
-
             TF_SELECTION selection = {};
             ULONG fetched = 0;
-            hr = _context->GetSelection(editCookie, TF_DEFAULT_SELECTION, 1, &selection, &fetched);
+            HRESULT hr = _context->GetSelection(editCookie, TF_DEFAULT_SELECTION, 1, &selection, &fetched);
             if (SUCCEEDED(hr) && fetched == 1 && selection.range)
             {
+                selection.range->Collapse(editCookie, TF_ANCHOR_END);
                 _result = selection.range->SetText(
                     editCookie,
                     0,
                     _text.c_str(),
                     static_cast<LONG>(_text.size()));
+                selection.range->Collapse(editCookie, TF_ANCHOR_END);
+                _context->SetSelection(editCookie, 1, &selection);
                 selection.range->Release();
                 return _result;
             }
@@ -110,14 +99,26 @@ namespace
     class SetSelectionTextEditSession final : public ITfEditSession
     {
     public:
-        SetSelectionTextEditSession(ITfContext* context, std::wstring text, LONG replaceLength)
-            : _refCount(1), _context(context), _text(std::move(text)), _replaceLength(replaceLength), _result(E_FAIL)
+        SetSelectionTextEditSession(ITfContext* context, std::wstring text, LONG replaceLength, ITfRange* displayRange)
+            : _refCount(1), _context(context), _displayRange(displayRange), _text(std::move(text)), _replaceLength(replaceLength), _result(E_FAIL)
         {
         }
 
         HRESULT GetResult() const
         {
             return _result;
+        }
+
+        HRESULT CopyUpdatedRange(ITfRange** range) const
+        {
+            if (!range)
+                return E_POINTER;
+
+            *range = nullptr;
+            if (!_updatedRange)
+                return S_FALSE;
+
+            return _updatedRange->Clone(range);
         }
 
         IFACEMETHODIMP QueryInterface(REFIID riid, void** ppvObj) override
@@ -158,6 +159,39 @@ namespace
                 return _result;
             }
 
+            if (_displayRange)
+            {
+                CComPtr<ITfRange> replacementRange;
+                HRESULT hr = _displayRange->Clone(&replacementRange);
+                if (SUCCEEDED(hr) && replacementRange)
+                {
+                    _result = replacementRange->SetText(
+                        editCookie,
+                        0,
+                        _text.c_str(),
+                        static_cast<LONG>(_text.size()));
+                    if (SUCCEEDED(_result))
+                    {
+                        if (!_text.empty())
+                            replacementRange->Clone(&_updatedRange);
+
+                        CComPtr<ITfRange> caretRange;
+                        hr = replacementRange->Clone(&caretRange);
+                        if (SUCCEEDED(hr) && caretRange)
+                        {
+                            caretRange->Collapse(editCookie, TF_ANCHOR_END);
+                            TF_SELECTION newSelection = {};
+                            newSelection.range = caretRange;
+                            newSelection.style.ase = TF_AE_NONE;
+                            newSelection.style.fInterimChar = FALSE;
+                            _context->SetSelection(editCookie, 1, &newSelection);
+                        }
+                    }
+
+                    return _result;
+                }
+            }
+
             TF_SELECTION selection = {};
             ULONG fetched = 0;
             HRESULT hr = _context->GetSelection(editCookie, TF_DEFAULT_SELECTION, 1, &selection, &fetched);
@@ -179,6 +213,9 @@ namespace
                 0,
                 _text.c_str(),
                 static_cast<LONG>(_text.size()));
+            if (SUCCEEDED(_result) && !_text.empty())
+                selection.range->Clone(&_updatedRange);
+
             selection.range->Collapse(editCookie, TF_ANCHOR_END);
             _context->SetSelection(editCookie, 1, &selection);
             selection.range->Release();
@@ -190,6 +227,8 @@ namespace
 
         long _refCount;
         CComPtr<ITfContext> _context;
+        CComPtr<ITfRange> _displayRange;
+        CComPtr<ITfRange> _updatedRange;
         std::wstring _text;
         LONG _replaceLength;
         HRESULT _result;
@@ -335,6 +374,7 @@ HRESULT TextService::Deactivate()
         _engine->Shutdown();
     _threadMgr.Release();
     _clientId = TF_CLIENTID_NULL;
+    _displayRange.Release();
     _readingBuffer.clear();
     _displayText.clear();
     _candidates.clear();
@@ -547,6 +587,8 @@ HRESULT TextService::HandleCommit(ITfContext* context)
         return replaceHr;
     }
 
+    _displayRange.Release();
+
     if (!commitText.empty())
     {
         _committedText += commitText;
@@ -563,7 +605,7 @@ HRESULT TextService::HandleCommit(ITfContext* context)
     UpdateCandidateWindow();
 
     if (!_candidates.empty())
-        return ReplaceDisplayedText(context, BuildDisplayText());
+        return S_OK;
 
     return EndComposition(context);
 }
@@ -609,6 +651,7 @@ HRESULT TextService::HandleBackspace(ITfContext* context)
         HRESULT hr = ReplaceDisplayedText(context, L"");
         if (FAILED(hr))
             return hr;
+        _displayRange.Release();
         HideCandidateWindow();
         return EndComposition(context);
     }
@@ -639,6 +682,7 @@ HRESULT TextService::HandleCancel(ITfContext* context)
     HRESULT hr = ReplaceDisplayedText(context, L"");
     if (FAILED(hr))
         return hr;
+    _displayRange.Release();
     return EndComposition(context);
 }
 
@@ -718,7 +762,7 @@ HRESULT TextService::UpdateCompositionText(ITfContext* context, const std::wstri
     if (!context || _clientId == TF_CLIENTID_NULL)
         return S_OK;
 
-    SetSelectionTextEditSession* editSession = new (std::nothrow) SetSelectionTextEditSession(context, text, 0);
+    SetSelectionTextEditSession* editSession = new (std::nothrow) SetSelectionTextEditSession(context, text, 0, nullptr);
     if (!editSession)
         return E_OUTOFMEMORY;
 
@@ -743,7 +787,7 @@ HRESULT TextService::ReplaceDisplayedText(ITfContext* context, const std::wstrin
         return S_OK;
 
     LONG replaceLength = static_cast<LONG>(_displayText.size());
-    SetSelectionTextEditSession* editSession = new (std::nothrow) SetSelectionTextEditSession(context, text, replaceLength);
+    SetSelectionTextEditSession* editSession = new (std::nothrow) SetSelectionTextEditSession(context, text, replaceLength, _displayRange);
     if (!editSession)
         return E_OUTOFMEMORY;
 
@@ -757,10 +801,15 @@ HRESULT TextService::ReplaceDisplayedText(ITfContext* context, const std::wstrin
     if (SUCCEEDED(hr))
         hr = editSessionResult;
 
-    editSession->Release();
-
     if (SUCCEEDED(hr))
+    {
         _displayText = text;
+        _displayRange.Release();
+        if (!text.empty())
+            editSession->CopyUpdatedRange(&_displayRange);
+    }
+
+    editSession->Release();
 
     return hr;
 }
