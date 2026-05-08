@@ -1,0 +1,9 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="DataGenerator/DataGenerator.csproj" Id="79600111-0ee2-4722-a559-26086beab353" />
+  <Project Path="MaloneCangJie/MaloneCangJie.vcxproj" Id="b13d7f8f-33c3-477a-b055-a9d8994fdbb6" />
+</Solution>
