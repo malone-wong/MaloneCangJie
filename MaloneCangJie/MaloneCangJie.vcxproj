@@ -153,6 +153,7 @@
     <ClInclude Include="sqlite3.h" />
     <ClInclude Include="sqlite3ext.h" />
     <ClInclude Include="TextService.h" />
+    <ClInclude Include="Version.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ClassFactory.cpp" />
@@ -184,7 +185,10 @@
     <ClCompile Include="TextService.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <Text Include="notes.txt" />
+    <Text Include="changes.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="MaloneCangJie.rc" />
   </ItemGroup>
   <ItemGroup>
     <CopyFileToFolders Include="MaloneCangJie.db">
