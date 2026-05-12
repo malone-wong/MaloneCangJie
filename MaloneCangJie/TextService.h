@@ -16,7 +16,7 @@
 
 //class DictionaryEngine;
 
-class TextService : public ITfTextInputProcessorEx, public ITfKeyEventSink
+class TextService : public ITfTextInputProcessorEx, public ITfKeyEventSink, public ITfActiveLanguageProfileNotifySink
 {
 public:
     TextService();
@@ -40,15 +40,22 @@ public:
     IFACEMETHODIMP OnKeyDown(ITfContext* pic, WPARAM wParam, LPARAM lParam, BOOL* pfEaten) override;
     IFACEMETHODIMP OnKeyUp(ITfContext* pic, WPARAM wParam, LPARAM lParam, BOOL* pfEaten) override;
     IFACEMETHODIMP OnPreservedKey(ITfContext* pic, REFGUID rguid, BOOL* pfEaten) override;
+
+    // ITfActiveLanguageProfileNotifySink
+    IFACEMETHODIMP OnActivated(REFCLSID clsid, REFGUID guidProfile, BOOL activated) override;
 private:
     ~TextService();
 
     HRESULT AdviseKeyEventSink();
     HRESULT UnadviseKeyEventSink();
+    HRESULT AdviseActiveLanguageProfileNotifySink();
+    HRESULT UnadviseActiveLanguageProfileNotifySink();
 
     bool IsImeOn() const;
     bool IsCodeKey(WPARAM vk) const;
     wchar_t CodeKeyToChar(WPARAM vk) const;
+    bool IsPunctuationKey(WPARAM vk) const;
+    wchar_t PunctuationKeyToFullWidthChar(WPARAM vk) const;
     bool IsCommitKey(WPARAM vk) const;
     bool IsCancelKey(WPARAM vk) const;
     bool IsSelectCandidateKey(WPARAM vk, int& index) const;
@@ -57,6 +64,7 @@ private:
     bool HasActiveInput() const;
 
     HRESULT HandleCodeInput(ITfContext* context, wchar_t ch);
+    HRESULT HandlePunctuationInput(ITfContext* context, wchar_t ch);
     HRESULT HandleBackspace(ITfContext* context);
     HRESULT HandleDelete(ITfContext* context);
     HRESULT HandleCommit(ITfContext* context);
@@ -70,6 +78,8 @@ private:
 
     void RefreshCandidates();
     void RefreshAssociatedWordCandidates();
+    void RememberCommittedText(const std::wstring& text);
+    void ClearInputState();
     std::wstring BuildDisplayText() const;
     std::wstring BuildCandidateWindowText() const;
     HRESULT ReplaceDisplayedText(ITfContext* context, const std::wstring& text);
@@ -82,7 +92,9 @@ private:
     long _refCount;
     TfClientId _clientId;
     DWORD _keySinkCookie;
+    DWORD _profileNotifySinkCookie;
     bool _keyEventSinkAdvised;
+    bool _profileNotifySinkAdvised;
 
     CComPtr<ITfThreadMgr> _threadMgr;
     CComPtr<ITfComposition> _composition;

@@ -456,7 +456,9 @@ TextService::TextService()
     : _refCount(1),
       _clientId(TF_CLIENTID_NULL),
       _keySinkCookie(TF_INVALID_COOKIE),
+      _profileNotifySinkCookie(TF_INVALID_COOKIE),
       _keyEventSinkAdvised(false),
+      _profileNotifySinkAdvised(false),
       _threadMgr(nullptr),
       _candidateWindow(nullptr),
       _selectedIndex(0),
@@ -512,6 +514,13 @@ HRESULT TextService::QueryInterface(REFIID riid, void** ppvObj)
 		log_to_file(LOG_LEVEL_DEBUG, "end TextService::QueryInterface - ITfKeyEventSink");
         return S_OK;
     }
+    if (riid == IID_ITfActiveLanguageProfileNotifySink)
+    {
+        *ppvObj = static_cast<ITfActiveLanguageProfileNotifySink*>(this);
+        AddRef();
+        log_to_file(LOG_LEVEL_DEBUG, "end TextService::QueryInterface - ITfActiveLanguageProfileNotifySink");
+        return S_OK;
+    }
 
     log_guid_to_file(LOG_LEVEL_ERROR, "TextService::QueryInterface E_NOINTERFACE riid=", riid);
     return E_NOINTERFACE;
@@ -546,24 +555,23 @@ HRESULT TextService::ActivateEx(ITfThreadMgr* ptim, TfClientId tid, DWORD dwFlag
         return hr;
     }
 
+    hr = AdviseActiveLanguageProfileNotifySink();
+    if (FAILED(hr))
+        log_to_file(LOG_LEVEL_ERROR, "TextService::ActivateEx AdviseActiveLanguageProfileNotifySink failed");
+
     return S_OK;
 }
 
 HRESULT TextService::Deactivate()
 {
     log_to_file(LOG_LEVEL_DEBUG, "TextService::Deactivate");
-    HideCandidateWindow();
-    _composition.Release();
+    ClearInputState();
+    UnadviseActiveLanguageProfileNotifySink();
     UnadviseKeyEventSink();
     if (_engine)
         _engine->Shutdown();
     _threadMgr.Release();
     _clientId = TF_CLIENTID_NULL;
-    _displayRange.Release();
-    _readingBuffer.clear();
-    _displayText.clear();
-    _candidates.clear();
-    _selectedIndex = 0;
     return S_OK;
 }
 
@@ -615,19 +623,75 @@ HRESULT TextService::UnadviseKeyEventSink()
     return hr;
 }
 
+HRESULT TextService::AdviseActiveLanguageProfileNotifySink()
+{
+    log_to_file(LOG_LEVEL_DEBUG, "TextService::AdviseActiveLanguageProfileNotifySink");
+    if (!_threadMgr)
+        return E_UNEXPECTED;
+
+    if (_profileNotifySinkAdvised)
+        return S_OK;
+
+    CComPtr<ITfSource> source;
+    HRESULT hr = _threadMgr->QueryInterface(IID_ITfSource, (void**)&source);
+    if (FAILED(hr))
+        return hr;
+
+    hr = source->AdviseSink(
+        IID_ITfActiveLanguageProfileNotifySink,
+        static_cast<ITfActiveLanguageProfileNotifySink*>(this),
+        &_profileNotifySinkCookie);
+
+    if (hr == CONNECT_E_ADVISELIMIT || hr == TF_E_ALREADY_EXISTS)
+    {
+        _profileNotifySinkAdvised = true;
+        return S_OK;
+    }
+
+    if (SUCCEEDED(hr))
+        _profileNotifySinkAdvised = true;
+
+    return hr;
+}
+
+HRESULT TextService::UnadviseActiveLanguageProfileNotifySink()
+{
+    log_to_file(LOG_LEVEL_DEBUG, "TextService::UnadviseActiveLanguageProfileNotifySink");
+    if (!_threadMgr || !_profileNotifySinkAdvised || _profileNotifySinkCookie == TF_INVALID_COOKIE)
+        return S_OK;
+
+    CComPtr<ITfSource> source;
+    HRESULT hr = _threadMgr->QueryInterface(IID_ITfSource, (void**)&source);
+    if (FAILED(hr))
+        return hr;
+
+    hr = source->UnadviseSink(_profileNotifySinkCookie);
+    if (SUCCEEDED(hr))
+    {
+        _profileNotifySinkAdvised = false;
+        _profileNotifySinkCookie = TF_INVALID_COOKIE;
+    }
+
+    return hr;
+}
+
 HRESULT TextService::OnSetFocus(BOOL fForeground)
 {
 	log_to_file(LOG_LEVEL_DEBUG, "TextService::OnSetFocus");
     if (!fForeground)
-    {
-        _readingBuffer.clear();
-        _displayText.clear();
-        _candidates.clear();
-        _selectedIndex = 0;
-        _displayRange.Release();
-        _composition.Release();
-        HideCandidateWindow();
-    }
+        ClearInputState();
+
+    return S_OK;
+}
+
+HRESULT TextService::OnActivated(REFCLSID clsid, REFGUID guidProfile, BOOL activated)
+{
+    log_to_file(LOG_LEVEL_DEBUG, "TextService::OnActivated");
+    UNREFERENCED_PARAMETER(guidProfile);
+
+    bool isThisService = IsEqualGUID(clsid, CLSID_MyTextService) != FALSE;
+    if ((isThisService && !activated) || (!isThisService && activated))
+        ClearInputState();
 
     return S_OK;
 }
@@ -644,6 +708,7 @@ HRESULT TextService::OnTestKeyDown(ITfContext*, WPARAM wParam, LPARAM, BOOL* pfE
     *pfEaten = IsImeOn() &&
         !HasShortcutModifier() &&
         (IsCodeKey(wParam) ||
+         IsPunctuationKey(wParam) ||
          (IsCommitKey(wParam) && hasActiveInput) ||
          (IsCancelKey(wParam) && hasActiveInput) ||
          ((wParam == VK_BACK || wParam == VK_DELETE) && hasActiveInput) ||
@@ -703,6 +768,13 @@ HRESULT TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM, BOOL*
         return S_OK;
 
     int candidateIndex = -1;
+
+    if (IsPunctuationKey(wParam))
+    {
+        *pfEaten = TRUE;
+        wchar_t ch = PunctuationKeyToFullWidthChar(wParam);
+        return HandlePunctuationInput(context, ch);
+    }
 
     if (IsSelectCandidateKey(wParam, candidateIndex) && !_candidates.empty())
     {
@@ -784,14 +856,7 @@ HRESULT TextService::HandleCommit(ITfContext* context)
     }
 
     _displayRange.Release();
-
-    if (!commitText.empty())
-    {
-        _committedText += commitText;
-        int leadingMaxLength = _engine ? _engine->GetAssociatedLeadingMaxLength() : 3;
-        if (leadingMaxLength > 0 && _committedText.size() > static_cast<size_t>(leadingMaxLength))
-            _committedText.erase(0, _committedText.size() - static_cast<size_t>(leadingMaxLength));
-    }
+    RememberCommittedText(commitText);
 
     _readingBuffer.clear();
     _displayText.clear();
@@ -823,6 +888,33 @@ HRESULT TextService::HandleCodeInput(ITfContext* context, wchar_t ch)
     HRESULT hr = ReplaceDisplayedText(context, BuildDisplayText());
     if (SUCCEEDED(hr))
         UpdateCandidateWindow();
+
+    return hr;
+}
+
+HRESULT TextService::HandlePunctuationInput(ITfContext* context, wchar_t ch)
+{
+    log_to_file(LOG_LEVEL_DEBUG, "TextService::HandlePunctuationInput");
+    if (!context || ch == L'\0')
+        return S_OK;
+
+    if (HasActiveInput())
+    {
+        HRESULT commitHr = HandleCommit(context);
+        if (FAILED(commitHr))
+            return commitHr;
+    }
+
+    std::wstring punctuation(1, ch);
+    HRESULT hr = InsertTextAtSelection(context, punctuation);
+    if (FAILED(hr))
+        return hr;
+
+    RememberCommittedText(punctuation);
+    _candidates.clear();
+    _selectedIndex = 0;
+    RefreshAssociatedWordCandidates();
+    UpdateCandidateWindow();
 
     return hr;
 }
@@ -934,6 +1026,29 @@ void TextService::RefreshAssociatedWordCandidates()
 
     if (_engine)
         _candidates = _engine->LookupAssociatedWords(_committedText, 0, CandidatePageSize);
+}
+
+void TextService::RememberCommittedText(const std::wstring& text)
+{
+    if (text.empty())
+        return;
+
+    _committedText += text;
+    int leadingMaxLength = _engine ? _engine->GetAssociatedLeadingMaxLength() : 3;
+    if (leadingMaxLength > 0 && _committedText.size() > static_cast<size_t>(leadingMaxLength))
+        _committedText.erase(0, _committedText.size() - static_cast<size_t>(leadingMaxLength));
+}
+
+void TextService::ClearInputState()
+{
+    _readingBuffer.clear();
+    _displayText.clear();
+    _candidateWindowText.clear();
+    _candidates.clear();
+    _selectedIndex = 0;
+    _displayRange.Release();
+    _composition.Release();
+    HideCandidateWindow();
 }
 
 HRESULT TextService::StartComposition(ITfContext* context)
@@ -1266,6 +1381,62 @@ wchar_t TextService::CodeKeyToChar(WPARAM vk) const
         return L'?';
 
     return static_cast<wchar_t>(vk);
+}
+
+bool TextService::IsPunctuationKey(WPARAM vk) const
+{
+    log_to_file(LOG_LEVEL_DEBUG, "TextService::IsPunctuationKey");
+    bool shiftDown = IsShiftDown();
+
+    if (!shiftDown && (vk == VK_OEM_COMMA || vk == VK_OEM_PERIOD ||
+        vk == VK_OEM_1 || vk == VK_OEM_2 || vk == VK_OEM_7))
+        return true;
+
+    return shiftDown && (vk == '1' || vk == '9' || vk == '0' ||
+        vk == VK_OEM_1 || vk == VK_OEM_2 || vk == VK_OEM_7);
+}
+
+wchar_t TextService::PunctuationKeyToFullWidthChar(WPARAM vk) const
+{
+    log_to_file(LOG_LEVEL_DEBUG, "TextService::PunctuationKeyToFullWidthChar");
+    bool shiftDown = IsShiftDown();
+
+    if (!shiftDown)
+    {
+        switch (vk)
+        {
+        case VK_OEM_COMMA:
+            return L'\uFF0C';
+        case VK_OEM_PERIOD:
+            return L'\u3002';
+        case VK_OEM_1:
+            return L'\uFF1B';
+        case VK_OEM_2:
+            return L'\u3001';
+        case VK_OEM_7:
+            return L'\uFF07';
+        default:
+            break;
+        }
+    }
+
+    switch (vk)
+    {
+    case '1':
+        return L'\uFF01';
+    case '9':
+        return L'\uFF08';
+    case '0':
+        return L'\uFF09';
+    case VK_OEM_1:
+        return L'\uFF1A';
+    case VK_OEM_2:
+        return L'\uFF1F';
+    case VK_OEM_7:
+        return L'\uFF02';
+    default:
+        return L'\0';
+    }
 }
 
 bool TextService::HasShortcutModifier() const

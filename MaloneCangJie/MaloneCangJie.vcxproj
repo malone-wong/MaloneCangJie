@@ -186,6 +186,7 @@
   </ItemGroup>
   <ItemGroup>
     <Text Include="changes.txt" />
+    <Text Include="notes.txt" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="MaloneCangJie.rc" />
