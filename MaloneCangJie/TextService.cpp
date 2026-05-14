@@ -418,6 +418,86 @@ namespace
         HRESULT _result;
     };
 
+    class CandidateAnchorEditSession final : public ITfEditSession
+    {
+    public:
+        CandidateAnchorEditSession(ITfContext* context, ITfRange* range)
+            : _refCount(1), _context(context), _range(range), _result(E_FAIL), _clipped(FALSE)
+        {
+            SetRectEmpty(&_rect);
+        }
+
+        HRESULT GetResult() const
+        {
+            return _result;
+        }
+
+        RECT GetRect() const
+        {
+            return _rect;
+        }
+
+        IFACEMETHODIMP QueryInterface(REFIID riid, void** ppvObj) override
+        {
+            if (!ppvObj)
+                return E_POINTER;
+
+            *ppvObj = nullptr;
+            if (riid == IID_IUnknown || riid == IID_ITfEditSession)
+            {
+                *ppvObj = static_cast<ITfEditSession*>(this);
+                AddRef();
+                return S_OK;
+            }
+
+            return E_NOINTERFACE;
+        }
+
+        IFACEMETHODIMP_(ULONG) AddRef() override
+        {
+            return static_cast<ULONG>(InterlockedIncrement(&_refCount));
+        }
+
+        IFACEMETHODIMP_(ULONG) Release() override
+        {
+            long refCount = InterlockedDecrement(&_refCount);
+            if (refCount == 0)
+                delete this;
+
+            return static_cast<ULONG>(refCount);
+        }
+
+        IFACEMETHODIMP DoEditSession(TfEditCookie editCookie) override
+        {
+            if (!_context || !_range)
+            {
+                _result = E_INVALIDARG;
+                return _result;
+            }
+
+            CComPtr<ITfContextView> view;
+            HRESULT hr = _context->GetActiveView(&view);
+            if (FAILED(hr) || !view)
+            {
+                _result = FAILED(hr) ? hr : E_FAIL;
+                return _result;
+            }
+
+            _result = view->GetTextExt(editCookie, _range, &_rect, &_clipped);
+            return _result;
+        }
+
+    private:
+        ~CandidateAnchorEditSession() = default;
+
+        long _refCount;
+        CComPtr<ITfContext> _context;
+        CComPtr<ITfRange> _range;
+        RECT _rect;
+        BOOL _clipped;
+        HRESULT _result;
+    };
+
     std::wstring GetDatabasePath()
     {
         wchar_t modulePath[MAX_PATH] = {};
@@ -435,7 +515,7 @@ namespace
         return path;
     }
 
-    POINT GetCandidateWindowAnchor()
+    POINT GetFallbackCandidateWindowAnchor()
     {
         POINT point = {};
         HWND focusWindow = GetFocus();
@@ -865,7 +945,7 @@ HRESULT TextService::HandleCommit(ITfContext* context)
     HRESULT endHr = EndComposition(context);
 
     RefreshAssociatedWordCandidates();
-    UpdateCandidateWindow();
+    UpdateCandidateWindow(context);
 
     return endHr;
 }
@@ -887,7 +967,7 @@ HRESULT TextService::HandleCodeInput(ITfContext* context, wchar_t ch)
 
     HRESULT hr = ReplaceDisplayedText(context, BuildDisplayText());
     if (SUCCEEDED(hr))
-        UpdateCandidateWindow();
+        UpdateCandidateWindow(context);
 
     return hr;
 }
@@ -914,7 +994,7 @@ HRESULT TextService::HandlePunctuationInput(ITfContext* context, wchar_t ch)
     _candidates.clear();
     _selectedIndex = 0;
     RefreshAssociatedWordCandidates();
-    UpdateCandidateWindow();
+    UpdateCandidateWindow(context);
 
     return hr;
 }
@@ -945,7 +1025,7 @@ HRESULT TextService::HandleBackspace(ITfContext* context)
 
     HRESULT hr = ReplaceDisplayedText(context, BuildDisplayText());
     if (SUCCEEDED(hr))
-        UpdateCandidateWindow();
+        UpdateCandidateWindow(context);
 
     return hr;
 }
@@ -1181,7 +1261,7 @@ bool TextService::EnsureCandidateWindow()
     return _candidateWindow != nullptr;
 }
 
-void TextService::UpdateCandidateWindow()
+void TextService::UpdateCandidateWindow(ITfContext* context)
 {
     _candidateWindowText = BuildCandidateWindowText();
     if (_candidateWindowText.empty())
@@ -1211,7 +1291,9 @@ void TextService::UpdateCandidateWindow()
 
     int width = (textRect.right - textRect.left) + (CandidateWindowPaddingX * 2);
     int height = (textRect.bottom - textRect.top) + (CandidateWindowPaddingY * 2);
-    POINT anchor = GetCandidateWindowAnchor();
+    POINT anchor = {};
+    if (!TryGetCandidateWindowAnchor(context, anchor))
+        anchor = GetFallbackCandidateWindowAnchor();
 
     SetWindowPos(
         _candidateWindow,
@@ -1222,6 +1304,36 @@ void TextService::UpdateCandidateWindow()
         height,
         SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(_candidateWindow, nullptr, TRUE);
+}
+
+bool TextService::TryGetCandidateWindowAnchor(ITfContext* context, POINT& anchor) const
+{
+    if (!context || !_displayRange || _clientId == TF_CLIENTID_NULL)
+        return false;
+
+    CandidateAnchorEditSession* editSession = new (std::nothrow) CandidateAnchorEditSession(context, _displayRange);
+    if (!editSession)
+        return false;
+
+    HRESULT editSessionResult = E_FAIL;
+    HRESULT hr = context->RequestEditSession(
+        _clientId,
+        editSession,
+        TF_ES_SYNC | TF_ES_READ,
+        &editSessionResult);
+
+    if (SUCCEEDED(hr))
+        hr = editSessionResult;
+
+    RECT textExt = editSession->GetRect();
+    editSession->Release();
+
+    if (FAILED(hr) || IsRectEmpty(&textExt))
+        return false;
+
+    anchor.x = textExt.left;
+    anchor.y = textExt.bottom + 4;
+    return true;
 }
 
 void TextService::HideCandidateWindow()

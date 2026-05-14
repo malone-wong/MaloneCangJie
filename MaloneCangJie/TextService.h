@@ -83,9 +83,10 @@ private:
     std::wstring BuildDisplayText() const;
     std::wstring BuildCandidateWindowText() const;
     HRESULT ReplaceDisplayedText(ITfContext* context, const std::wstring& text);
-    void UpdateCandidateWindow();
+    void UpdateCandidateWindow(ITfContext* context = nullptr);
     void HideCandidateWindow();
     bool EnsureCandidateWindow();
+    bool TryGetCandidateWindowAnchor(ITfContext* context, POINT& anchor) const;
     static LRESULT CALLBACK CandidateWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 
 private:
